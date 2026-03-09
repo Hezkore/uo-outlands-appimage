@@ -19,6 +19,7 @@ local_*.cfg
 /dev/
 .editorconfig
 .github/*
+!.github/dependabot.yml
 !.github/workflows
 .github/workflows/*
 !.github/workflows/release.yml

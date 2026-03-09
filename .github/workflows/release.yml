@@ -19,8 +19,195 @@ on:
         type: number
         default: 0
 
-# No permissions by default. Each job declares only what it needs.
-permissions: {}
+# Read-only by default. Each job declares only the extra permissions it needs.
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      appimage_name: ${{ steps.version.outputs.appimage_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject no-op release
+        if: inputs.major == 0 && inputs.minor == 0 && inputs.patch == 0
+        run: |
+          echo "All version bumps are 0, nothing to release"
+          exit 1
+
+      - name: Compute version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          source settings.conf
+          IFS='.' read -r current_major current_minor current_patch <<< "$release_version"
+          new_major=$(( current_major + ${{ inputs.major }} ))
+          new_minor=$(( current_minor + ${{ inputs.minor }} ))
+          new_patch=$(( current_patch + ${{ inputs.patch }} ))
+          version="${new_major}.${new_minor}.${new_patch}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Computed version is not valid semver: $version"
+            exit 1
+          fi
+          appimage_name="${release_name_prefix}-${version}-${release_arch}.AppImage"
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+          echo "appimage_name=${appimage_name}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # Required for actions/attest-build-provenance to sign via Sigstore.
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends file tar wget zenity zsync
+
+      - name: Build AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export UPDATE_INFO="gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|latest|${{ needs.prepare.outputs.appimage_name }}.zsync"
+          chmod +x build.sh
+          mkdir -p release
+          ./build.sh release
+
+      - name: Rename and verify AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          appimage_name="${{ needs.prepare.outputs.appimage_name }}"
+          mv release/UO-Outlands-x86_64.AppImage "release/${appimage_name}"
+          [[ -s "release/${appimage_name}" ]]
+          file "release/${appimage_name}" | grep -qiE 'AppImage|ELF'
+
+      - name: Generate checksums and zsync
+        shell: bash
+        run: |
+          set -euo pipefail
+          appimage_name="${{ needs.prepare.outputs.appimage_name }}"
+          cd release
+          sha256sum "${appimage_name}" \
+            | awk '{print $1 " " $2}' \
+            > "${appimage_name}.sha256"
+          sha256sum -c "${appimage_name}.sha256"
+          zsyncmake -C \
+            -u "https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}/releases/latest/download/${appimage_name}" \
+            -o "${appimage_name}.zsync" \
+            "${appimage_name}"
+          sha256sum "${appimage_name}.zsync" \
+            | awk '{print $1 " " $2}' \
+            > "${appimage_name}.zsync.sha256"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release/${{ needs.prepare.outputs.appimage_name }}
+            release/${{ needs.prepare.outputs.appimage_name }}.zsync
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-appimage
+          path: |
+            release/${{ needs.prepare.outputs.appimage_name }}
+            release/${{ needs.prepare.outputs.appimage_name }}.sha256
+
+      - name: Upload zsync
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-zsync
+          path: |
+            release/${{ needs.prepare.outputs.appimage_name }}.zsync
+            release/${{ needs.prepare.outputs.appimage_name }}.zsync.sha256
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Verify checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c "${{ needs.prepare.outputs.appimage_name }}.sha256"
+          sha256sum -c "${{ needs.prepare.outputs.appimage_name }}.zsync.sha256"
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          appimage_name="${{ needs.prepare.outputs.appimage_name }}"
+          appimage_hash=$(cut -d' ' -f1 "${appimage_name}.sha256")
+          zsync_hash=$(cut -d' ' -f1 "${appimage_name}.zsync.sha256")
+          {
+            printf 'Release %s\n' "$version"
+            printf '\nSHA256 for %s\n' "$appimage_name"
+            printf '%s %s\n' "$appimage_hash" "$appimage_name"
+            printf '\nSHA256 for %s\n' "${appimage_name}.zsync"
+            printf '%s %s\n' "$zsync_hash" "${appimage_name}.zsync"
+          } > release-notes.txt
+
+      - name: Publish GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          appimage_name="${{ needs.prepare.outputs.appimage_name }}"
+          gh release create "v${version}" \
+            "${appimage_name}" \
+            "${appimage_name}.sha256" \
+            "${appimage_name}.zsync" \
+            "${appimage_name}.zsync.sha256" \
+            --title "UO Outlands ${version}" \
+            --notes-file release-notes.txt
+
+      - name: Bump version in repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          sed -i "s/^release_version=.*/release_version=${version}/" settings.conf
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add settings.conf
+          git commit -m "Bump release version to ${version}"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
 
 jobs:
   prepare:

@@ -361,7 +361,10 @@ print_step "Building AppImage"
 print_info "Source: $STAGING_DIR"
 print_info "Output: $OUTPUT"
 
-ARCH="$release_arch" "$APPIMAGETOOL" --runtime-file "$RUNTIME" "$STAGING_DIR" "$OUTPUT"
+appimagetool_args=(--runtime-file "$RUNTIME")
+# Embed update information when the caller provides it (used by release builds).
+[[ -n "${UPDATE_INFO:-}" ]] && appimagetool_args+=(-u "$UPDATE_INFO")
+ARCH="$release_arch" "$APPIMAGETOOL" "${appimagetool_args[@]}" "$STAGING_DIR" "$OUTPUT"
 
 # Reset mode because appimagetool marks the output executable and we want
 # reproducible build artifacts.
