@@ -1,0 +1,81 @@
+name: Bump build tool
+
+on:
+  workflow_dispatch:
+    inputs:
+      tool:
+        description: Tool to bump
+        required: true
+        type: choice
+        options:
+          - appimagetool
+          - runtime
+          - curl
+
+# Read-only by default; the bump job requests write to commit the change
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download tool and update hash
+        id: bump
+        env:
+          TOOL: ${{ inputs.tool }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$TOOL" in
+            appimagetool)
+              url="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+              conf_key="appimagetool_sha256"
+              ;;
+            runtime)
+              url="https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64"
+              conf_key="runtime_sha256"
+              ;;
+            curl)
+              url="https://github.com/moparisthebest/static-curl/releases/latest/download/curl-amd64"
+              conf_key="curl_bundle_sha256"
+              ;;
+            *)
+              echo "Unknown tool: $TOOL"
+              exit 1
+              ;;
+          esac
+
+          curl -fsSL -o tool_binary "$url"
+          new_sha256="$(sha256sum tool_binary | cut -d' ' -f1)"
+          rm tool_binary
+
+          current_sha256="$(grep "^${conf_key}=" constants/project.conf | cut -d'=' -f2)"
+          if [[ "$new_sha256" == "$current_sha256" ]]; then
+            echo "$TOOL is already at ${new_sha256}, nothing to bump"
+            exit 1
+          fi
+
+          sed -i "s/^${conf_key}=.*/${conf_key}=${new_sha256}/" constants/project.conf
+          echo "new_sha256=${new_sha256}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        env:
+          TOOL: ${{ inputs.tool }}
+          NEW_SHA256: ${{ steps.bump.outputs.new_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add constants/project.conf
+          git commit -m "Bump ${TOOL} to ${NEW_SHA256:0:12}"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

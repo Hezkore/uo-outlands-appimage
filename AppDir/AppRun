@@ -1,0 +1,922 @@
+#!/bin/bash
+# UO Outlands AppImage runtime
+#
+# On first run it downloads GE-Proton and the Outlands installer and walks the user through setup
+# On later runs it launches the installed game directly
+
+set -euo pipefail
+umask 077
+trap '' PIPE
+# = Bootstrap ================================================================
+# Make bundled tools (curl etc. shipped inside the AppImage) available first
+# In a running AppImage $APPDIR is set by the runtime
+# The fallback is for dev use
+APPDIR="${APPDIR:-$(dirname "$(readlink -f "$0")")}" 
+export PATH="$APPDIR/usr/bin:$PATH"
+PROJECT_CONSTANTS_PATH="$APPDIR/usr/share/uooutlands/project.conf"
+DEV_PROJECT_CONSTANTS_PATH="$APPDIR/../constants/project.conf"
+
+if [[ -f "$PROJECT_CONSTANTS_PATH" ]]; then
+	# shellcheck disable=SC1090
+	source "$PROJECT_CONSTANTS_PATH"
+elif [[ -f "$DEV_PROJECT_CONSTANTS_PATH" ]]; then
+	# shellcheck disable=SC1090
+	source "$DEV_PROJECT_CONSTANTS_PATH"
+fi
+
+# Point the bundled curl at the CA certs we ship inside the AppImage
+# If for some reason they are absent, fall back to common system locations
+ca_cert_bundle="$APPDIR/etc/ssl/certs/ca-certificates.crt"
+if [[ ! -f "$ca_cert_bundle" ]]; then
+	for ca_cert_candidate in /etc/ssl/certs/ca-certificates.crt \
+				/etc/pki/tls/certs/ca-bundle.crt \
+				/etc/ssl/ca-bundle.pem \
+				/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem; do
+		[[ -f "$ca_cert_candidate" ]] && { ca_cert_bundle="$ca_cert_candidate"; break; }
+	done
+fi
+export CURL_CA_BUNDLE="$ca_cert_bundle"
+export SSL_CERT_FILE="$ca_cert_bundle"   # also covers other tools that respect this
+
+# = ANSI colours =============================================================
+if [[ -t 1 ]]; then
+	reset='\e[0m' bold='\e[1m' dim='\e[2m' red='\e[31m' green='\e[32m' cyan='\e[36m'
+else
+	reset='' bold='' dim='' red='' green='' cyan=''
+fi
+readonly reset bold dim red green cyan
+# = Configuration ============================================================
+
+readonly EXIT_SUCCESS=0
+readonly EXIT_ERROR=1
+readonly BYTES_PER_MB=1048576
+
+readonly APP_NAME="${app_name:-UO Outlands}"
+readonly PROTON_VER="${proton_version:-GE-Proton10-16}"
+readonly _proton_base="https://github.com/GloriousEggroll/proton-ge-custom"
+readonly PROTON_URL="${proton_url:-${_proton_base}/releases/download/${PROTON_VER}/${PROTON_VER}.tar.gz}"
+readonly OUTLANDS_URL="${outlands_url:-https://patch.uooutlands.com/download}"
+
+# Allow the user to override the data directory via environment variable
+DATA_DIR="${UOOUTLANDS_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/${data_dir_name:-uooutlands}}"
+
+readonly PROTON_DIR="$DATA_DIR/proton/$PROTON_VER"
+readonly COMPATDATA_DIR="$DATA_DIR/compatdata"
+readonly PREFIX_DIR="$COMPATDATA_DIR/pfx"
+readonly LEGACY_PREFIX_DIR="$DATA_DIR/prefix"
+readonly LEGACY_INSTALLER_PATH="$DATA_DIR/Outlands-Installer.exe"
+readonly INSTALLER_PATH="$DATA_DIR/Outlands.exe"
+readonly GAME_EXE="$PREFIX_DIR/drive_c/Program Files (x86)/Ultima Online Outlands/Outlands.exe"
+readonly LOCK_DIR="$DATA_DIR/.lock"
+readonly MIN_FREE_MB="${min_free_space_mb:-4096}"
+
+is_status_active=false
+STATUS_FIFO=""
+STATUS_FD=""
+STATUS_PID=""
+STATUS_PHASE_START=0
+STATUS_PHASE_END=100
+STATUS_PHASE_LABEL=""
+is_launch_notice_active=false
+LAUNCH_NOTICE_FIFO=""
+LAUNCH_NOTICE_PID=""
+LAUNCH_NOTICE_FEED_PID=""
+
+# = Utilities ================================================================
+
+has_command() { command -v "$1" &>/dev/null; }
+write_log()  { printf "${dim}[UO Outlands]${reset} %s\n" "$*" >&2; }
+
+# Load the lang file matching the system locale, falling back to English
+_load_lang() {
+	local lang_code
+	lang_code="${LANG:-}"
+	lang_code="${lang_code%%_*}"
+	lang_code="${lang_code:-en}"
+
+	local lang_dir="$APPDIR/usr/share/uooutlands/lang"
+	[[ -d "$lang_dir" ]] || lang_dir="$APPDIR/../lang"
+	[[ -d "$lang_dir" ]] || return 0
+
+	local lang_file="$lang_dir/${lang_code}.conf"
+	[[ -f "$lang_file" ]] || lang_file="$lang_dir/en.conf"
+	[[ -f "$lang_file" ]] || return 0
+
+	local line key value
+	while IFS= read -r line; do
+		[[ "$line" =~ ^[[:space:]]*# ]] && continue
+		[[ -z "${line// /}" ]] && continue
+		key="${line%%=*}"
+		value="${line#*=}"
+		[[ -z "$key" ]] && continue
+		printf -v "$key" '%s' "$value"
+	done < "$lang_file"
+}
+
+# Return a lang string for key, substituting {1}, {2}, ... with extra args
+translate_string() {
+	local key="$1" translated_value
+	translated_value="${!key:-$key}"
+	shift
+	local i=1
+	for argument in "$@"; do
+		translated_value="${translated_value/\{$i\}/$argument}"
+		(( i++ )) || true
+	done
+	printf '%s' "$translated_value"
+}
+
+# shellcheck disable=SC2329,SC2317
+cleanup() {
+	if [[ -d "$LOCK_DIR" ]]; then rmdir "$LOCK_DIR" 2>/dev/null || true; fi
+}
+
+trap cleanup EXIT
+
+# = dialog_tool / terminal detection =========================================
+
+# Which dialog tool is available?
+if   has_command zenity;  then dialog_tool=zenity
+elif has_command yad;     then dialog_tool=yad
+elif has_command kdialog; then dialog_tool=kdialog
+else                    dialog_tool=none
+fi
+
+# Which download tool is available?
+# Bundled curl in $APPDIR/usr/bin takes priority
+if   has_command curl; then download_tool=curl
+elif has_command wget; then download_tool=wget
+else                 download_tool=none
+fi
+
+# If launched without a terminal AND without a dialog tool, relaunch in a terminal
+if [[ ! -t 1 && "$dialog_tool" == "none" ]]; then
+	for _term in xterm x-terminal-emulator gnome-terminal konsole \
+				 xfce4-terminal lxterminal mate-terminal; do
+		has_command "$_term" || continue
+		case "$_term" in
+			gnome-terminal) exec gnome-terminal -- "$0" "$@" ;;
+			konsole)        exec konsole        -e "$0" "$@" ;;
+			*)              exec "$_term"       -e "$0" "$@" ;;
+		esac
+	done
+	has_command xmessage && xmessage -center \
+		"$(translate_string error_no_terminal "$APP_NAME")" 2>/dev/null
+	exit $EXIT_ERROR
+fi
+
+die() {
+	write_log "FATAL: $*"
+	_status_end || true
+	_show_error "$(translate_string title_error "$APP_NAME")" "$*"
+	exit $EXIT_ERROR
+}
+
+_ensure_dir() {
+	local path="$1"
+	mkdir -p "$path"
+	chmod 700 "$path" 2>/dev/null || true
+}
+
+_ensure_writable_dir() {
+	local path="$1"
+	_ensure_dir "$path"
+	local probe
+	probe="$(mktemp "$path/.write-test.XXXXXX")" \
+		|| die "$(translate_string error_dir_not_writable "$path")"
+	rm -f "$probe"
+}
+
+_require_supported_arch() {
+	local arch
+	arch="$(uname -m 2>/dev/null || echo unknown)"
+	[[ "$arch" == "x86_64" || "$arch" == "amd64" ]] \
+		|| die "$(translate_string error_arch_not_supported "$APP_NAME" "$arch")"
+}
+
+_require_safe_data_dir() {
+	[[ -n "$DATA_DIR" ]] || die "$(translate_string error_data_dir_empty)"
+	[[ "$DATA_DIR" != "/" ]] || die "$(translate_string error_data_dir_root)"
+}
+
+_check_free_space() {
+	local path="$1" required_mb="$2" available_mb
+	available_mb="$(df -Pm "$path" 2>/dev/null | awk 'NR==2 {print $4}')"
+	available_mb="$(printf '%s' "${available_mb:-0}" | tr -cd '0-9')"
+	[[ -n "$available_mb" ]] || available_mb=0
+	(( available_mb >= required_mb )) \
+		|| die "$(translate_string error_not_enough_space_mb \
+			"$path" "$required_mb" "$available_mb")"
+}
+
+_acquire_lock() {
+	mkdir "$LOCK_DIR" 2>/dev/null \
+		|| die "$(translate_string error_already_running "$APP_NAME" "$LOCK_DIR")"
+}
+
+_is_windows_executable() {
+	local path="$1"
+	if has_command file; then
+		file "$path" 2>/dev/null | grep -qiE 'PE32|PE32\+|MS-DOS executable|DOS executable'
+		return $?
+	fi
+
+	[[ "$(LC_ALL=C head -c 2 "$path" 2>/dev/null || true)" == "MZ" ]]
+}
+
+_validate_downloaded_launcher() {
+	local path="$1"
+	[[ -s "$path" ]] || die "$(translate_string error_launcher_empty "$path")"
+	_is_windows_executable "$path" \
+		|| die "$(translate_string error_launcher_not_windows "$path")"
+}
+
+_validate_proton_tarball() {
+	local path="$1"
+	[[ -s "$path" ]] || die "$(translate_string error_proton_archive_empty "$path")"
+	# Checking magic bytes is enough since reading the full index on a 700 MB archive is slow
+	file "$path" 2>/dev/null | grep -qi "gzip compressed" \
+		|| die "$(translate_string error_proton_archive_invalid "$path")"
+}
+
+_preflight_checks() {
+	_require_supported_arch
+	_require_safe_data_dir
+	_ensure_writable_dir "$DATA_DIR"
+	_ensure_writable_dir "$DATA_DIR/proton"
+	_acquire_lock
+}
+
+# = Dialog helpers ===========================================================
+
+# Boxed message in the terminal
+_show_text_box() {
+	local title="$1" body="$2"
+	local sep; sep=$(printf '─%.0s' {1..60})
+	printf "\n${dim}%s${reset}\n${bold}  %s${reset}\n${dim}%s${reset}\n\n" "$sep" "$title" "$sep"
+	printf "%s\n" "$body" | while IFS= read -r line; do printf "  %s\n" "$line"; done
+	printf "\n"
+}
+
+# shellcheck disable=SC2329,SC2317
+_show_info() {
+	local title="$1" message="$2"
+	case "$dialog_tool" in
+		zenity)  zenity  --info  --title="$title" --text="$message" --width=480 2>/dev/null || true ;;
+		yad)     yad     --info  --title="$title" --text="$message" --width=480 2>/dev/null || true ;;
+		kdialog) kdialog --title "$title" --msgbox "$message" 2>/dev/null || true ;;
+		none)    _show_text_box "$title" "$message"
+				 read -rp "$(translate_string prompt_continue) " _ </dev/tty 2>/dev/null || true ;;
+	esac
+}
+
+_show_error() {
+	local title="$1" message="$2"
+	case "$dialog_tool" in
+		zenity)  zenity  --error --title="$title" --text="$message" --width=480 2>/dev/null || true ;;
+		yad)     yad     --error --title="$title" --text="$message" --width=480 2>/dev/null || true ;;
+		kdialog) kdialog --title "$title" --error "$message" 2>/dev/null || true ;;
+		none)    _show_text_box "${red}$title${reset}" "$message"
+				 read -rp "$(translate_string prompt_continue) " _ </dev/tty 2>/dev/null || true ;;
+	esac
+}
+
+# shellcheck disable=SC2329,SC2317
+_ask_yes_no() {
+	local title="$1" message="$2"
+	case "$dialog_tool" in
+		zenity)  zenity  --question --title="$title" --text="$message" --width=480 \
+						 --ok-label="$(translate_string button_install)" \
+						 --cancel-label="$(translate_string button_cancel)" 2>/dev/null ;;
+		yad)     yad     --question --title="$title" --text="$message" --width=480 \
+						 --button="$(translate_string button_install):0" \
+						 --button="$(translate_string button_cancel):1" 2>/dev/null ;;
+		kdialog) kdialog --title "$title" --yesno "$message" 2>/dev/null ;;
+		none)    _show_text_box "$title" "$message"
+				 local reply
+				 read -rp "$(translate_string prompt_install) " reply </dev/tty 2>/dev/null || true
+				 local yes_pattern="${prompt_yes_pattern:-[Yy]}"
+				 [[ -z "$reply" || "$reply" =~ ^${yes_pattern} ]] ;;
+	esac
+}
+
+_status_begin() {
+	[[ "$dialog_tool" == "none" ]] && return 0
+	[[ "$is_status_active" == true ]] && return 0
+
+	local fifo_dir
+	fifo_dir="$(mktemp -d)"
+	STATUS_FIFO="$fifo_dir/status.fifo"
+	mkfifo "$STATUS_FIFO"
+
+	case "$dialog_tool" in
+		zenity)
+			zenity --progress --no-cancel --title="$APP_NAME" --text="$(translate_string message_preparing)" \
+				--percentage=0 --auto-close --width=520 < "$STATUS_FIFO" >/dev/null 2>&1 &
+			;;
+		yad)
+			yad --progress --no-cancel --title="$APP_NAME" --text="$(translate_string message_preparing)" \
+				--percentage=0 --auto-close --width=520 < "$STATUS_FIFO" >/dev/null 2>&1 &
+			;;
+		*)
+			rm -f "$STATUS_FIFO"
+			rmdir "$fifo_dir" 2>/dev/null || true
+			STATUS_FIFO=""
+			return 0
+			;;
+	esac
+
+	STATUS_PID=$!
+	exec {STATUS_FD}>"$STATUS_FIFO"
+	rm -f "$STATUS_FIFO"
+	rmdir "$fifo_dir" 2>/dev/null || true
+	is_status_active=true
+}
+
+# Set the progress range (start%, end%) and label for the current phase
+_status_phase() {
+	STATUS_PHASE_START=$1
+	STATUS_PHASE_END=$2
+	STATUS_PHASE_LABEL="$3"
+}
+
+_status_update() {
+	[[ "$is_status_active" == true ]] || return 0
+	[[ -n "$STATUS_FD" ]] || return 0
+	local percentage="$1" text="$2"
+	{ printf '%s\n# %s\n' "$percentage" "$text" >&$STATUS_FD; } 2>/dev/null || true
+}
+
+# Report progress within the active phase, mapping percentage into the phase range
+_status_phase_progress() {
+	local percentage="$1" detail="$2"
+	local span=$(( STATUS_PHASE_END - STATUS_PHASE_START ))
+	local mapped=$(( STATUS_PHASE_START + (percentage * span / 100) ))
+	local text="$STATUS_PHASE_LABEL"
+	(( mapped < STATUS_PHASE_START )) && mapped=$STATUS_PHASE_START
+	(( mapped > STATUS_PHASE_END )) && mapped=$STATUS_PHASE_END
+	[[ -n "$detail" ]] && text+="$(translate_string status_phase_separator)$detail"
+	_status_update "$mapped" "$text"
+}
+
+_status_end() {
+	[[ "$is_status_active" == true ]] || return 0
+	_status_update 100 "$(translate_string message_done)"
+	sleep 0.2
+	exec {STATUS_FD}>&- 2>/dev/null || true
+	wait "$STATUS_PID" 2>/dev/null || true
+	is_status_active=false
+	STATUS_FIFO=""
+	STATUS_FD=""
+	STATUS_PID=""
+}
+
+_start_launching_notice() {
+	[[ "$dialog_tool" == "none" ]] && return 0
+	[[ "$is_launch_notice_active" == true ]] && return 0
+
+	case "$dialog_tool" in
+		zenity)
+			local fifo_dir
+			fifo_dir="$(mktemp -d)"
+			LAUNCH_NOTICE_FIFO="$fifo_dir/notice.fifo"
+			mkfifo "$LAUNCH_NOTICE_FIFO"
+			zenity --progress --pulsate --auto-close --no-cancel \
+				--title="$APP_NAME" --text="$(translate_string app_launching)" --width=420 \
+				< "$LAUNCH_NOTICE_FIFO" >/dev/null 2>&1 &
+			LAUNCH_NOTICE_PID=$!
+			( trap '' PIPE; while :; do echo ""; sleep 0.1; done > "$LAUNCH_NOTICE_FIFO" ) 2>/dev/null &
+			LAUNCH_NOTICE_FEED_PID=$!
+			rm -f "$LAUNCH_NOTICE_FIFO"
+			rmdir "$fifo_dir" 2>/dev/null || true
+			;;
+		yad)
+			local fifo_dir
+			fifo_dir="$(mktemp -d)"
+			LAUNCH_NOTICE_FIFO="$fifo_dir/notice.fifo"
+			mkfifo "$LAUNCH_NOTICE_FIFO"
+			yad --progress --pulsate --auto-close --no-cancel \
+				--title="$APP_NAME" --text="$(translate_string app_launching)" --width=420 \
+				< "$LAUNCH_NOTICE_FIFO" >/dev/null 2>&1 &
+			LAUNCH_NOTICE_PID=$!
+			( trap '' PIPE; while :; do echo ""; sleep 0.1; done > "$LAUNCH_NOTICE_FIFO" ) 2>/dev/null &
+			LAUNCH_NOTICE_FEED_PID=$!
+			rm -f "$LAUNCH_NOTICE_FIFO"
+			rmdir "$fifo_dir" 2>/dev/null || true
+			;;
+		kdialog)
+			kdialog --title "$APP_NAME" --passivepopup "$(translate_string app_launching)" 30 >/dev/null 2>&1 &
+			LAUNCH_NOTICE_PID=$!
+			;;
+	esac
+
+	is_launch_notice_active=true
+}
+
+_stop_launching_notice() {
+	[[ "$is_launch_notice_active" == true ]] || return 0
+	if [[ -n "$LAUNCH_NOTICE_FEED_PID" ]]; then kill "$LAUNCH_NOTICE_FEED_PID" 2>/dev/null || true; fi
+	if [[ -n "$LAUNCH_NOTICE_FEED_PID" ]]; then wait "$LAUNCH_NOTICE_FEED_PID" 2>/dev/null || true; fi
+	if [[ -n "$LAUNCH_NOTICE_PID" ]]; then wait "$LAUNCH_NOTICE_PID" 2>/dev/null || true; fi
+	is_launch_notice_active=false
+	LAUNCH_NOTICE_FIFO=""
+	LAUNCH_NOTICE_PID=""
+	LAUNCH_NOTICE_FEED_PID=""
+}
+
+_outlands_is_running() {
+	pgrep -af 'Outlands\.exe|Patch\.Client' >/dev/null 2>&1
+}
+
+_launch_target() {
+	local target="$1"
+	local launch_log="$DATA_DIR/launch.log"
+	local launch_pid elapsed=0 min_ticks=20
+
+	_start_launching_notice
+	write_log "Launching: $target"
+
+	"$PROTON" run "$target" > "$launch_log" 2>&1 &
+	launch_pid=$!
+
+	while (( elapsed < 600 )); do
+		if _outlands_is_running; then
+			while (( elapsed < min_ticks )); do
+				sleep 0.1
+				(( elapsed++ )) || true
+			done
+			_stop_launching_notice
+			return 0
+		fi
+
+		if ! kill -0 "$launch_pid" 2>/dev/null && (( elapsed > 20 )); then
+			break
+		fi
+
+		sleep 0.1
+		(( elapsed++ )) || true
+	done
+
+	_stop_launching_notice
+	die "$(translate_string error_launch_failed "$launch_log")"
+}
+
+# = Progress helpers =========================================================
+
+# Draw a terminal progress bar given percentage, bytes done and bytes total
+_draw_bar() {
+	local percentage=$1 current_bytes=$2 total=$3 width=40 i
+	local bar_fill="" bar_empty=""
+	for (( i=0; i<percentage*width/100;    i++ )); do bar_fill+="█";  done
+	for (( i=${#bar_fill}; i<width; i++ )); do bar_empty+="░"; done
+	local current_mb_int=$(( current_bytes / BYTES_PER_MB ))
+	local current_mb_dec=$(( (current_bytes % BYTES_PER_MB) * 10 / BYTES_PER_MB ))
+	local total_mb_int=$(( total / BYTES_PER_MB ))
+	local total_mb_dec=$(( (total % BYTES_PER_MB) * 10 / BYTES_PER_MB ))
+	local bar_format="\r  ${bold}[${green}%s${dim}%s${reset}${bold}]"
+	bar_format+="${reset}  %3d%%  ${cyan}%d.%d${reset} / ${cyan}%d.%d MB${reset}   "
+	# shellcheck disable=SC2059
+	printf "$bar_format" \
+		"$bar_fill" "$bar_empty" "$percentage" \
+		"$current_mb_int" "$current_mb_dec" "$total_mb_int" "$total_mb_dec"
+}
+
+# Run a command showing a spinner (terminal) or pulsating bar (dialog_tool)
+# Passes along the command's exit code
+_run_with_spinner() {
+	local message="$1"; shift
+	if [[ "$dialog_tool" != "none" && "$is_status_active" == true ]]; then
+		"$@" &
+		local pid=$! i=0 suffix percentage exit_code
+		while kill -0 "$pid" 2>/dev/null; do
+			case $(( i % 4 )) in
+				1) suffix="." ;;
+				2) suffix=".." ;;
+				3) suffix="..." ;;
+				*) suffix="" ;;
+			esac
+			percentage=$(( (i % 10) * 10 ))
+			_status_phase_progress "$percentage" "$(translate_string message_working)$suffix"
+			sleep 0.3
+			(( i++ )) || true
+		done
+		wait "$pid"
+		exit_code=$?
+		_status_phase_progress 100 "$(translate_string message_done)"
+		return "$exit_code"
+	fi
+
+	if [[ "$dialog_tool" != "none" ]]; then
+		"$@" &
+		local pid=$!
+		# Ignore PIPE so the subshell is not killed if zenity closes stdin early
+		# The || true on the pipe prevents pipefail from triggering so wait can check the exit code
+		( trap '' PIPE; while kill -0 "$pid" 2>/dev/null; do echo ""; sleep 0.3; done ) 2>/dev/null \
+			| { case "$dialog_tool" in
+					zenity)  zenity  --progress --pulsate --auto-close --no-cancel \
+									 --title="$APP_NAME" --text="$message" --width=480 2>/dev/null || true ;;
+					yad)     yad     --progress --pulsate --auto-close \
+									 --title="$APP_NAME" --text="$message" --width=480 2>/dev/null || true ;;
+					kdialog) cat > /dev/null ;;
+				esac; } || true
+		wait "$pid"
+	else
+		printf "\n  ${bold}%s${reset} " "$message"
+		"$@" &
+		local pid=$! i=0 spinner_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+		while kill -0 "$pid" 2>/dev/null; do
+			printf "\r  ${bold}%s${reset} %s " "$message" "${spinner_chars:$(( i % ${#spinner_chars} )):1}"
+			sleep 0.1; (( i++ )) || true
+		done
+		printf "\r  ${bold}%s${reset} ${green}✓${reset}   \n" "$message"
+		wait "$pid"
+	fi
+}
+
+# = Download with real progress ==============================================
+
+# Get Content-Length for a URL (follows redirects)
+_content_length() {
+	local url="$1" content_length
+	case "$download_tool" in
+		curl) content_length=$(curl -fsSLI "$url" 2>/dev/null | grep -i '^content-length:' | tail -1 \
+					   | awk '{print $2}' | tr -d '\r\n') || true
+			  if [[ -z "${content_length:-}" || "$content_length" == "0" ]]; then
+				  content_length=$(curl -fsSL -r 0-0 -D - -o /dev/null "$url" 2>/dev/null \
+						   | sed -n 's/^content-range: bytes 0-0\/\([0-9][0-9]*\).*/\1/ip' \
+						   | tail -1) || true
+			  fi ;;
+		wget) content_length=$(wget --spider --server-response -q "$url" 2>&1 \
+					   | grep -i 'Content-Length:' | tail -1 \
+					   | awk '{print $2}' | tr -d '\r\n') ;;
+	esac
+	printf '%s' "$(printf '%s' "${content_length:-0}" | tr -cd '0-9')"
+}
+
+# Runs in the background so the caller can handle all progress display
+_download_silent() {
+	case "$download_tool" in
+		curl) curl -fsSL -o "$2" "$1" ;;
+		wget) wget -q    -O "$2" "$1" ;;
+	esac
+}
+
+_download_file() {
+	local url="$1" dest="$2" title="$3" message="${4:-Downloading…}"
+	local tmp_dest="${dest}.part.$$"
+	mkdir -p "$(dirname "$dest")"
+	[[ "$download_tool" != "none" ]] \
+		|| die "$(translate_string error_curl_missing)"
+	write_log "Downloading: $url"
+
+	rm -f "$dest"
+	rm -f "$tmp_dest"
+
+	# Starts immediately so we have something downloading while we probe the content-length
+	_download_silent "$url" "$tmp_dest" &
+	local download_pid=$!
+
+	# Fetch content-length in a background subshell so something is always visible
+	local content_length_file; content_length_file="$(mktemp)"
+	( _content_length "$url" > "$content_length_file" 2>/dev/null ) &
+	local content_length_pid=$!
+
+	local spinner_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' spinner_index=0
+
+	if [[ "$dialog_tool" != "none" && "$is_status_active" == true ]]; then
+		while kill -0 "$download_pid" 2>/dev/null; do
+			local total=0 current_bytes=0 dots suffix=""
+			[[ -s "$content_length_file" ]] && total=$(cat "$content_length_file" 2>/dev/null || echo 0)
+			total=$(printf '%s' "${total:-0}" | tr -cd '0-9')
+			[[ -f "$tmp_dest" ]] && current_bytes=$(stat -c%s "$tmp_dest" 2>/dev/null || echo 0)
+
+			if [[ "${total:-0}" -gt 0 ]]; then
+				local percentage=$(( current_bytes * 100 / total ))
+				(( percentage > 99 )) && percentage=99
+				local current_mb_int=$(( current_bytes / BYTES_PER_MB ))
+				local current_mb_dec=$(( (current_bytes % BYTES_PER_MB) * 10 / BYTES_PER_MB ))
+				local total_mb_int=$(( total / BYTES_PER_MB ))
+				local total_mb_dec=$(( (total % BYTES_PER_MB) * 10 / BYTES_PER_MB ))
+				_status_phase_progress "$percentage" \
+					"$current_mb_int.$current_mb_dec / $total_mb_int.$total_mb_dec MB"
+			else
+				dots=$(( spinner_index % 4 ))
+				case "$dots" in
+					1) suffix="." ;;
+					2) suffix=".." ;;
+					3) suffix="..." ;;
+				esac
+				_status_phase_progress 0 "$(translate_string message_connecting)$suffix"
+			fi
+
+			sleep 0.3
+			(( spinner_index++ )) || true
+		done
+		kill "$content_length_pid" 2>/dev/null || true
+		wait "$content_length_pid" 2>/dev/null || true
+		rm -f "$content_length_file"
+		if ! wait "$download_pid"; then
+			rm -f "$tmp_dest"
+			die "$(translate_string error_download_failed "$url")"
+		fi
+		mv -f "$tmp_dest" "$dest"
+		_status_phase_progress 100 "$(translate_string message_done)"
+		return 0
+	fi
+
+	if [[ "$dialog_tool" != "none" ]]; then
+		# Start at 0% immediately so the user sees activity at once, then switch
+		# to real percentages as soon as the total size probe returns
+		( trap '' PIPE
+			local total_bytes=0 dots=0
+			while kill -0 "$download_pid" 2>/dev/null; do
+				if [[ "$total_bytes" -eq 0 && -s "$content_length_file" ]]; then
+					total_bytes=$(cat "$content_length_file" 2>/dev/null || echo 0)
+					total_bytes=$(printf '%s' "${total_bytes:-0}" | tr -cd '0-9')
+				fi
+				local current_bytes=0
+				[[ -f "$tmp_dest" ]] && current_bytes=$(stat -c%s "$tmp_dest" 2>/dev/null || echo 0)
+				if [[ "$total_bytes" -gt 0 ]]; then
+					local percentage=$(( current_bytes * 100 / total_bytes ))
+					(( percentage > 99 )) && percentage=99
+					local current_mb_int=$(( current_bytes / BYTES_PER_MB ))
+					local current_mb_dec=$(( (current_bytes % BYTES_PER_MB) * 10 / BYTES_PER_MB ))
+					local total_mb_int=$(( total_bytes / BYTES_PER_MB ))
+					local total_mb_dec=$(( (total_bytes % BYTES_PER_MB) * 10 / BYTES_PER_MB ))
+					printf "%d\n# %s\n%d.%d / %d.%d MB\n" \
+						"$percentage" "$message" \
+						"$current_mb_int" "$current_mb_dec" \
+						"$total_mb_int" "$total_mb_dec"
+				else
+					local suffix=""
+					case $(( dots % 4 )) in
+						1) suffix="." ;;
+						2) suffix=".." ;;
+						3) suffix="..." ;;
+					esac
+					local connect_text preparing_text
+					connect_text="$(translate_string message_connecting)"
+					preparing_text="$(translate_string message_preparing_download)"
+					printf "0\n# %s%s\n%s\n" \
+						"$connect_text" "$suffix" "$preparing_text"
+					(( dots++ )) || true
+				fi
+				sleep 0.3
+			done
+			wait "$content_length_pid" 2>/dev/null || true
+			rm -f "$content_length_file"
+			printf "100\n"
+		) 2>/dev/null | { case "$dialog_tool" in
+			zenity)  zenity  --progress --auto-close --no-cancel \
+							 --title="$title" --text="$message" --width=480 2>/dev/null || true ;;
+			yad)     yad     --progress --auto-close \
+							 --title="$title" --text="$message" --width=480 2>/dev/null || true ;;
+			kdialog) cat > /dev/null ;;
+		esac; } || true
+		kill "$content_length_pid" 2>/dev/null || true
+		wait "$content_length_pid" 2>/dev/null || true
+		rm -f "$content_length_file"
+		if ! wait "$download_pid"; then
+			rm -f "$tmp_dest"
+			die "$(translate_string error_download_failed "$url")"
+		fi
+		mv -f "$tmp_dest" "$dest"
+
+	else
+		printf "\n  ${bold}%s${reset}\n\n" "$message"
+
+		# Show "Connecting…" spinner while waiting for content-length (max ~5 s)
+		local connect_message
+		connect_message="$(translate_string message_connecting)"
+		local wait_ticks=0
+		while kill -0 "$content_length_pid" 2>/dev/null \
+				&& [[ $wait_ticks -lt 50 ]]; do
+			printf "\r  ${dim}%s... %s${reset}   " \
+				"$connect_message" \
+				"${spinner_chars:$(( spinner_index % ${#spinner_chars} )):1}"
+			sleep 0.1
+			(( spinner_index++ )) || true
+			(( wait_ticks++ )) || true
+		done
+		kill "$content_length_pid" 2>/dev/null || true
+		wait "$content_length_pid" 2>/dev/null || true
+
+		local total; total=$(cat "$content_length_file" 2>/dev/null || echo 0)
+		total=$(printf '%s' "${total:-0}" | tr -cd '0-9')
+		rm -f "$content_length_file"
+
+		if [[ "${total:-0}" -gt 0 ]]; then
+			# Real percentage bar
+			while kill -0 "$download_pid" 2>/dev/null; do
+				local current_bytes=0
+				[[ -f "$tmp_dest" ]] && current_bytes=$(stat -c%s "$tmp_dest" 2>/dev/null || echo 0)
+				local percentage=$(( current_bytes * 100 / total ))
+				(( percentage > 99 )) && percentage=99
+				_draw_bar "$percentage" "$current_bytes" "$total"
+				sleep 0.3
+			done
+			if ! wait "$download_pid"; then
+				rm -f "$tmp_dest"
+				printf "\n"
+				die "$(translate_string error_download_failed "$url")"
+			fi
+			mv -f "$tmp_dest" "$dest"
+			_draw_bar 100 "$total" "$total"
+			printf "\n\n"
+		else
+			# Size unknown so spin until done
+			local download_message
+			download_message="$(translate_string message_downloading)"
+			while kill -0 "$download_pid" 2>/dev/null; do
+				printf "\r  ${dim}%s... %s${reset}   " \
+					"$download_message" \
+					"${spinner_chars:$(( spinner_index % ${#spinner_chars} )):1}"
+				sleep 0.1
+				(( spinner_index++ )) || true
+			done
+			if ! wait "$download_pid"; then
+				rm -f "$tmp_dest"
+				printf "\n"
+				die "$(translate_string error_download_failed "$url")"
+			fi
+			mv -f "$tmp_dest" "$dest"
+			printf "\r  ${green}✓${reset} $(translate_string message_done)%-30s\n\n" ""
+		fi
+	fi
+}
+
+# = Proton ===================================================================
+
+_install_proton() {
+	if [[ -d "$PROTON_DIR" ]]; then
+		write_log "GE-Proton $PROTON_VER already present."
+		return 0
+	fi
+
+	local tarball="$DATA_DIR/proton-download.tar.gz"
+
+	_status_phase 0 45 "$(translate_string message_downloading_proton "$PROTON_VER")"
+
+	_download_file \
+		"$PROTON_URL" "$tarball" \
+		"$(translate_string app_setup_title)" \
+		"$(translate_string message_downloading_proton "$PROTON_VER")"
+
+	_validate_proton_tarball "$tarball"
+
+	_status_phase 45 55 "$(translate_string message_extracting_proton)"
+	_run_with_spinner "$(translate_string message_extracting_proton)" \
+		tar -xf "$tarball" -C "$DATA_DIR/proton" \
+	|| die "$(translate_string error_proton_extract_failed "$tarball")"
+
+	rm -f "$tarball"
+
+	[[ -d "$PROTON_DIR" ]] \
+		|| die "$(translate_string error_proton_dir_unexpected "$PROTON_DIR")"
+	[[ -x "$PROTON_DIR/proton" ]] \
+		|| die "$(translate_string error_proton_binary_missing "$PROTON_DIR")"
+
+	write_log "GE-Proton installed at: $PROTON_DIR"
+}
+
+_find_proton() {
+	local proton="$PROTON_DIR/proton"
+	[[ -x "$proton" ]] || return 1
+	printf '%s\n' "$proton"
+}
+
+_setup_proton_env() {
+	PROTON=$(_find_proton) \
+		|| die "$(translate_string error_proton_not_found "$PROTON_DIR")"
+	export PROTON
+
+	mkdir -p "$COMPATDATA_DIR"
+
+	export STEAM_COMPAT_DATA_PATH="$COMPATDATA_DIR"
+	export STEAM_COMPAT_CLIENT_INSTALL_PATH="$DATA_DIR"
+	export STEAM_COMPAT_INSTALL_PATH="$DATA_DIR"
+	export STEAM_COMPAT_LIBRARY_PATHS="$DATA_DIR"
+	export STEAM_COMPAT_APP_ID=0
+	export SteamAppId=0
+	export WINEDLLOVERRIDES="tabtip.exe="
+	export WINEDEBUG="-all"
+	export WINEESYNC=1
+	export WINEFSYNC=1
+}
+
+# = Game installation ========================================================
+
+_install_game() {
+	mkdir -p "$DATA_DIR"
+	_check_free_space "$DATA_DIR" "$MIN_FREE_MB"
+	rm -rf "$PROTON_DIR" "$COMPATDATA_DIR" "$LEGACY_PREFIX_DIR"
+	rm -f "$INSTALLER_PATH" "$LEGACY_INSTALLER_PATH" "$DATA_DIR/proton-download.tar.gz"
+	mkdir -p "$DATA_DIR/proton"
+
+	_status_begin
+
+	_install_proton
+	_setup_proton_env
+
+	# Download the Outlands setup executable
+	rm -f "$INSTALLER_PATH" "$LEGACY_INSTALLER_PATH"
+	_status_phase 55 75 "$(translate_string message_downloading_game)"
+	_download_file \
+		"$OUTLANDS_URL" "$INSTALLER_PATH" \
+		"$(translate_string app_setup_title)" \
+		"$(translate_string message_downloading_game)"
+	_validate_downloaded_launcher "$INSTALLER_PATH"
+
+	# Initialise the Wine prefix without extra setup popups
+	local _wineboot_overrides="tabtip.exe=;winemenubuilder.exe="
+	_wineboot_overrides="${_wineboot_overrides};mscoree=;mshtml="
+	_status_phase 75 88 "$(translate_string message_init_prefix)"
+	_run_with_spinner "$(translate_string message_init_prefix)" \
+		env WINEDLLOVERRIDES="$_wineboot_overrides" "$PROTON" runinprefix wineboot --init || true
+
+	# Write the tabtip.exe DLL-override into the registry for permanence
+	# (The WINEDLLOVERRIDES env-var already handles the current session)
+	local reg_tmp="$DATA_DIR/tabtip_override.reg"
+	printf 'REGEDIT4\n\n[HKEY_CURRENT_USER\\Software\\Wine\\DllOverrides]\n"tabtip.exe"=""\n' \
+		> "$reg_tmp"
+	_status_phase 88 95 "$(translate_string message_configuring_wine)"
+	_run_with_spinner "$(translate_string message_configuring_wine)" "$PROTON" runinprefix regedit "$reg_tmp" || true
+	rm -f "$reg_tmp"
+
+	write_log "Game installed successfully."
+}
+
+# = Entry point ==============================================================
+
+main() {
+	_load_lang
+
+	local do_reinstall=false
+	for argument in "$@"; do
+		case "$argument" in
+			--reinstall)
+				do_reinstall=true
+				;;
+			--help|-h)
+				printf '%s\n' \
+					"$(translate_string help_usage)" \
+					"" \
+						"  $(translate_string help_opt_reinstall)" \
+						"              $(translate_string help_opt_reinstall_note)" \
+						"  $(translate_string help_opt_help)" \
+					"" \
+					"$(translate_string help_data_dir "$DATA_DIR")"
+				exit $EXIT_SUCCESS
+				;;
+		esac
+	done
+
+	_preflight_checks
+	has_command tar \
+		|| die "$(translate_string error_tar_missing)"
+	[[ "$download_tool" != "none" ]] \
+		|| die "$(translate_string error_no_downloader)"
+
+	# Migrate older downloads that used the temporary Outlands-Installer.exe name
+	if [[ ! -f "$INSTALLER_PATH" && -f "$LEGACY_INSTALLER_PATH" ]]; then
+		mv -f "$LEGACY_INSTALLER_PATH" "$INSTALLER_PATH"
+	fi
+
+	if $do_reinstall; then
+		write_log "Reinstall requested, removing Wine prefix and GE-Proton."
+		rm -rf "$PREFIX_DIR"
+		rm -rf "$PROTON_DIR"
+		rm -rf "$COMPATDATA_DIR" "$LEGACY_PREFIX_DIR"
+		rm -f  "$INSTALLER_PATH" "$LEGACY_INSTALLER_PATH"
+	fi
+
+	# If the launcher already exists, skip the full install and launch via Wine
+	if [[ -f "$INSTALLER_PATH" ]]; then
+		if [[ ! -d "$PROTON_DIR" ]]; then
+			_status_begin
+			_install_proton
+		fi
+		_setup_proton_env
+		_status_phase 95 99 "$(translate_string app_launching)"
+		_status_phase_progress 0 "$(translate_string message_preparing_wine)"
+		_status_end
+		_launch_target "$INSTALLER_PATH"
+		exit $EXIT_SUCCESS
+	fi
+
+	local launch_target="$GAME_EXE"
+
+	if [[ ! -f "$GAME_EXE" ]]; then
+		_install_game
+		launch_target="$INSTALLER_PATH"
+	fi
+
+	_status_phase 95 99 "$(translate_string app_launching)"
+	_status_phase_progress 0 "$(translate_string message_preparing_wine)"
+	_setup_proton_env
+	_status_end
+	_launch_target "$launch_target"
+}
+
+main "$@"
+exit $EXIT_SUCCESS
