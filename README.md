@@ -5,6 +5,8 @@ On first run it downloads GE Proton and the official Outlands launcher and keeps
 
 No manual Wine setup, no scattered files, just run the AppImage and play.
 
+[![Donate](https://img.buymeacoffee.com/button-api/?text=Donate%20&emoji=%F0%9F%91%BE&slug=hezkore&button_colour=FFDD00&font_colour=000000&font_family=Inter&outline_colour=000000&coffee_colour=ffffff)](https://www.buymeacoffee.com/hezkore)
+
 ## Why
 
 Outlands is a Windows game client.\
